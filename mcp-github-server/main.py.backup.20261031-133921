@@ -1,0 +1,723 @@
+﻿import os
+import base64
+import logging
+import time
+import asyncio
+import httpx
+import subprocess
+import json
+import re
+from typing import List, Optional, Dict, Any, Callable, Awaitable, TypeVar
+from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
+from fastapi import FastAPI, HTTPException
+from fastapi.openapi.utils import get_openapi
+from pydantic import BaseModel, Field, ConfigDict
+from github import Github, Auth, GithubException
+import uvicorn
+
+# ─────────────────────────────────────────────────────────────
+# Document Processing (Optional)
+# ─────────────────────────────────────────────────────────────
+try:
+    import docx
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+
+try:
+    import PyPDF2
+    HAS_PDF = True
+except ImportError:
+    HAS_PDF = False
+
+# ─────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("github-mcp")
+
+# ─────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────
+REPO_URL = "https://github.com/mnfst/awesome-free-llm-apis.git"
+LOCAL_REPO_PATH = "/app/awesome-free-llm-apis"
+LOCAL_DATA_JSON = f"{LOCAL_REPO_PATH}/data.json"
+LOCAL_README_MD = f"{LOCAL_REPO_PATH}/README.md"
+CACHE_TTL = 86400
+REQUEST_TIMEOUT = 30.0
+MAX_RETRIES = 3
+BASE_BACKOFF = 1.5
+
+PROVIDER_ENV_MAP = {
+    "Aion Labs": "AIONLABS_API_KEY",
+    "Cohere": "COHERE_API_KEY",
+    "Google Gemini": "GEMINI_API_KEY",
+    "Mistral AI": "MISTRAL_API_KEY",
+    "Z AI (Zhipu AI)": "ZAI_API_KEY",
+    "Cloudflare Workers AI": "CLOUDFLARE_API_KEY",
+    "Groq": "GROQ_API_KEY",
+    "Hugging Face": "HUGGINGFACE_API_KEY",
+    "Kilo Code": "KILO_API_KEY",
+    "LLM7.io": "LLM7_API_KEY",
+    "ModelScope": "MODELSCOPE_API_KEY",
+    "NVIDIA NIM": "NVIDIA_API_KEY",
+    "Ollama Cloud": "OLLAMA_API_KEY",
+    "OpenRouter": "OPENROUTER_API_KEY",
+    "OVHcloud AI Endpoints": "OVH_API_KEY",
+    "SiliconFlow": "SILICONFLOW_API_KEY",
+}
+
+# ─────────────────────────────────────────────────────────────
+# Domain Exceptions (Fixed __init__ typos)
+# ─────────────────────────────────────────────────────────────
+class GitHubRateLimitError(HTTPException):
+    def __init__(self, reset_at: int | None = None):
+        detail = "Límite de API GitHub alcanzado"
+        if reset_at:
+            detail += f". Reset: {datetime.fromtimestamp(reset_at).isoformat()}"
+        super().__init__(status_code=429, detail=detail)
+        self.reset_at = reset_at
+
+class GitHubAuthError(HTTPException):
+    def __init__(self, msg: str = "Token inválido o sin permisos"):
+        super().__init__(status_code=401, detail=msg)
+
+class GitHubNotFoundError(HTTPException):
+    def __init__(self, resource: str):
+        super().__init__(status_code=404, detail=f"Recurso no encontrado: {resource}")
+
+class GitHubValidationError(HTTPException):
+    def __init__(self, errors: list[dict]):
+        msgs = "; ".join(e.get("message", "") for e in errors)
+        super().__init__(status_code=422, detail=f"Validación fallida: {msgs}")
+
+class GitHubForbiddenError(HTTPException):
+    def __init__(self, reason: str):
+        super().__init__(status_code=403, detail=f"Prohibido: {reason}")
+
+# ─────────────────────────────────────────────────────────────
+# GitHub Retry Utility
+# ─────────────────────────────────────────────────────────────
+T = TypeVar("T")
+
+async def github_call_with_retry(
+    coro_factory: Callable[[], Awaitable[T]],
+    max_retries: int = MAX_RETRIES,
+    base_backoff: float = BASE_BACKOFF
+) -> T:
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return await coro_factory()
+        except GithubException as e:
+            last_exc = e
+            status = e.status
+            data = e.data or {}
+            headers = getattr(e, "headers", {}) or {}
+            if status == 401:
+                raise GitHubAuthError(data.get("message", "Credenciales inválidas"))
+            if status == 404:
+                raise GitHubNotFoundError(data.get("message", "Recurso no existe"))
+            if status == 422:
+                raise GitHubValidationError(data.get("errors", []))
+            if status == 403:
+                reset_header = headers.get("X-RateLimit-Reset") or headers.get("x-ratelimit-reset")
+                if reset_header and reset_header.isdigit():
+                    reset_at = int(reset_header)
+                    wait = max(1, reset_at - int(time.time()) + 2)
+                    logger.warning(f"Rate limit GitHub. Esperando {wait}s (intento {attempt+1}/{max_retries})")
+                    await asyncio.sleep(wait)
+                    continue
+                reason = data.get("message", "Acceso denegado")
+                if isinstance(data.get("errors"), list):
+                    reason = "; ".join(err.get("message", "") for err in data["errors"])
+                raise GitHubForbiddenError(reason)
+            if status == 429:
+                retry_after = headers.get("Retry-After")
+                wait = int(retry_after) if retry_after and retry_after.isdigit() else base_backoff * (attempt + 1)
+                logger.warning(f"429 GitHub. Backoff {wait}s")
+                await asyncio.sleep(wait)
+                continue
+            if 500 <= status < 600:
+                await asyncio.sleep(base_backoff * (attempt + 1))
+                continue
+            raise HTTPException(status_code=status, detail=data.get("message", str(e)))
+    raise HTTPException(status_code=500, detail=f"GitHub falló tras {max_retries} intentos: {last_exc}")
+
+# ─────────────────────────────────────────────────────────────
+# Repo Sync & Parse (Fase 2)
+# ─────────────────────────────────────────────────────────────
+def sync_repo() -> None:
+    try:
+        if os.path.exists(LOCAL_REPO_PATH):
+            logger.info("Actualizando repo awesome-free-llm-apis...")
+            result = subprocess.run(
+                ["git", "-C", LOCAL_REPO_PATH, "pull", "--ff-only"],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode != 0:
+                logger.warning(f"git pull falló: {result.stderr}. Reclonando...")
+                subprocess.run(["rm", "-rf", LOCAL_REPO_PATH], check=True)
+                _clone_repo()
+            else:
+                logger.info("Repo actualizado")
+        else:
+            _clone_repo()
+    except subprocess.TimeoutExpired:
+        logger.error("Timeout clonando/actualizando repo")
+    except Exception as e:
+        logger.error(f"Error sincronizando repo: {e}")
+
+def _clone_repo() -> None:
+    logger.info("Clonando awesome-free-llm-apis...")
+    result = subprocess.run(
+        ["git", "clone", "--depth", "1", REPO_URL, LOCAL_REPO_PATH],
+        capture_output=True, text=True, timeout=120
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to clone repo: {result.stderr}")
+    logger.info("Repo clonado")
+
+def parse_readme_metadata(readme_path: str) -> Dict[str, Dict]:
+    metadata = {}
+    try:
+        with open(readme_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        table_pattern = r"\|(?:\s*[^|]+\s*\|){3,}"
+        tables = re.findall(table_pattern, content, re.MULTILINE)
+        for table in tables:
+            rows = [row.strip() for row in table.strip().split("\n") if row.strip()]
+            if len(rows) < 2:
+                continue
+            headers = [h.strip().lower() for h in rows[0].split("|") if h.strip()]
+            provider_idx = next((i for i, h in enumerate(headers) if "provider" in h or "name" in h), 0)
+            desc_idx = next((i for i, h in enumerate(headers) if "descript" in h or "detail" in h), 1)
+            for row in rows[2:]:
+                cols = [c.strip() for c in row.split("|") if c.strip()]
+                if len(cols) > max(provider_idx, desc_idx):
+                    provider_name = cols[provider_idx]
+                    description = cols[desc_idx] if desc_idx < len(cols) else ""
+                    provider_name = re.sub(r"[*\[\]#]", "", provider_name).strip()
+                    description = re.sub(r"[*\[\]#]", "", description).strip()
+                    if provider_name and provider_name not in metadata:
+                        metadata[provider_name] = {"description": description, "source": "readme"}
+    except Exception as e:
+        logger.warning(f"No se pudo parsear README para metadata: {e}")
+    return metadata
+
+def load_local_providers_data() -> Dict:
+    sync_repo()
+    if not os.path.exists(LOCAL_DATA_JSON):
+        raise FileNotFoundError(f"No existe {LOCAL_DATA_JSON} tras sync_repo()")
+    with open(LOCAL_DATA_JSON, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if os.path.exists(LOCAL_README_MD):
+        readme_meta = parse_readme_metadata(LOCAL_README_MD)
+        for provider in data.get("providers", []):
+            name = provider.get("name")
+            if name in readme_meta:
+                provider["_enriched"] = readme_meta[name]
+    data["_last_sync"] = int(time.time())
+    data["_source"] = "local_repo"
+    return data
+
+# ─────────────────────────────────────────────────────────────
+# App State (Thread-Safe)
+# ─────────────────────────────────────────────────────────────
+class AppState:
+    def __init__(self):
+        self._providers_cache: Optional[Dict] = None
+        self._last_cache_time: float = 0
+        self._cache_lock = asyncio.Lock()
+        self._provider_metrics: Dict[str, Dict] = {}
+        self._github_client: Optional[Github] = None
+        self._http_client: Optional[httpx.AsyncClient] = None
+        self._configured_providers: Dict[str, Dict] = {}
+
+    async def initialize(self):
+        github_token = os.getenv("GITHUB_TOKEN")
+        if github_token:
+            self._github_client = Github(auth=Auth.Token(github_token), timeout=30)
+            try:
+                user = self._github_client.get_user().login
+                logger.info(f"GitHub conectado como: {user}")
+            except Exception as e:
+                logger.warning(f"GitHub token inválido: {e}")
+                self._github_client = Github(timeout=30)
+        else:
+            logger.warning("GITHUB_TOKEN no configurado - modo solo lectura pública")
+            self._github_client = Github(timeout=30)
+        self._http_client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
+        await self._validate_api_keys()
+
+    async def _validate_api_keys(self):
+        data = await self.get_providers_data()
+        for provider in data["providers"]:
+            env_var = PROVIDER_ENV_MAP.get(provider["name"])
+            api_key = os.getenv(env_var) if env_var else None
+            no_key_required = provider["name"] in ["Kilo Code", "LLM7.io", "OVHcloud AI Endpoints"]
+            if api_key or no_key_required:
+                enriched = provider.get("_enriched", {})
+                self._configured_providers[provider["name"]] = {
+                    "baseUrl": provider["baseUrl"],
+                    "api_key": api_key,
+                    "models": provider["models"],
+                    "category": provider["category"],
+                    "no_key_required": no_key_required,
+                    "env_var": env_var,
+                    "_enriched": enriched,
+                }
+                self._provider_metrics[provider["name"]] = {"success": 0, "errors": 0, "total_latency": 0.0}
+                desc = enriched.get("description", "")
+                logger.info(f"Proveedor configurado: {provider['name']} {'- ' + desc[:60] if desc else ''}")
+
+    async def shutdown(self):
+        if self._http_client:
+            await self._http_client.aclose()
+
+    async def get_providers_data(self) -> Dict:
+        async with self._cache_lock:
+            current_time = time.time()
+            if self._providers_cache is None or (current_time - self._last_cache_time) > CACHE_TTL:
+                try:
+                    logger.info("Cargando catálogo de modelos desde repo local...")
+                    self._providers_cache = load_local_providers_data()
+                    self._last_cache_time = current_time
+                except Exception as e:
+                    logger.error(f"Error cargando data.json local: {e}")
+                    if self._providers_cache is None:
+                        raise HTTPException(status_code=500, detail="Error en catálogo de modelos local.")
+            return self._providers_cache
+
+    def record_metric(self, provider: str, success: bool, latency: float):
+        if provider in self._provider_metrics:
+            m = self._provider_metrics[provider]
+            if success:
+                m["success"] += 1
+                m["total_latency"] += latency
+            else:
+                m["errors"] += 1
+
+    def get_best_provider(self, criteria: str) -> Optional[Dict]:
+        if not self._configured_providers:
+            return None
+        criteria_lower = criteria.lower()
+        candidates = []
+        for name, info in self._configured_providers.items():
+            metrics = self._provider_metrics.get(name, {})
+            error_rate = metrics.get("errors", 0) / max(1, metrics.get("success", 0) + metrics.get("errors", 0))
+            if error_rate > 0.5:
+                continue
+            score = 0
+            for model in info["models"]:
+                modality = model.get("modality", "").lower()
+                context_str = model.get("context", "0").replace("K", "000").replace("M", "000000")
+                try:
+                    context = int(''.join(filter(str.isdigit, context_str)))
+                except:
+                    context = 0
+                if any(x in criteria_lower for x in ["código", "code", "program"]):
+                    if "code" in modality:
+                        score += 10
+                if any(x in criteria_lower for x in ["contexto", "context", "largo"]):
+                    score += min(context // 10000, 50)
+                if any(x in criteria_lower for x in ["rápid", "fast", "speed"]):
+                    if name in ["Groq", "Cerebras", "Kilo Code"]:
+                        score += 20
+                enriched = info.get("_enriched", {})
+                tags = enriched.get("tags", []) if isinstance(enriched.get("tags"), list) else []
+                best_for = enriched.get("best_for", []) if isinstance(enriched.get("best_for"), list) else []
+                if "speed" in criteria_lower and "speed" in tags:
+                    score += 25
+                if "código" in criteria_lower and "code" in best_for:
+                    score += 20
+                if "fallback" in criteria_lower and "fallback" in tags:
+                    score += 15
+                if "privado" in criteria_lower and enriched.get("status") == "local":
+                    score += 30
+            if score > 0:
+                candidates.append((score, name, info))
+        if not candidates:
+            name = next(iter(self._configured_providers))
+            return {"name": name, **self._configured_providers[name]}
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best = candidates[0]
+        return {"name": best[1], **best[2]}
+
+state = AppState()
+
+# ─────────────────────────────────────────────────────────────
+# Lifespan
+# ─────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await state.initialize()
+    yield
+    await state.shutdown()
+
+app = FastAPI(title="GitHub MCP Server Pro", version="2.4.0", lifespan=lifespan)
+
+# ─────────────────────────────────────────────────────────────
+# Pydantic Models (Fixed: ConfigDict protected_namespaces)
+# ─────────────────────────────────────────────────────────────
+class BaseToolModel(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+class BuscarRepoInput(BaseToolModel):
+    query: str = Field(..., description="Término de búsqueda para repositorios de GitHub")
+
+class MapearRepoInput(BaseToolModel):
+    repo: str = Field(..., description="Nombre del repositorio")
+    ruta: str = Field("", description="Ruta de la carpeta")
+
+class LeerArchivoInput(BaseToolModel):
+    repo: str = Field(..., description="Nombre del repositorio")
+    ruta: str = Field(..., description="Ruta al archivo")
+
+class CrearIssueInput(BaseToolModel):
+    repo: str = Field(..., description="Nombre del repositorio")
+    titulo: str = Field(..., description="Título del issue")
+    cuerpo: str = Field(..., description="Descripción detallada")
+
+class ListarIssuesInput(BaseToolModel):
+    repo: str = Field(..., description="Nombre del repositorio")
+    estado: str = Field("open", description="Estado: 'open', 'closed' o 'all'")
+    limite: int = Field(10, ge=1, le=100)
+
+class BuscarCodigoInput(BaseToolModel):
+    query: str = Field(..., description="Consulta de código")
+
+class LeerLocalInput(BaseToolModel):
+    nombre_archivo: str = Field(..., description="Nombre del archivo en /app/local_docs")
+
+class BuscarModeloGratisInput(BaseToolModel):
+    criterio: str = Field(..., description="Criterio: 'modelo rápido', 'contexto largo', etc.")
+
+class ConsultarLLMExternoInput(BaseToolModel):
+    provider_id: Optional[str] = Field(None, description="ID del proveedor")
+    model_id: Optional[str] = Field(None, description="ID del modelo")
+    prompt: str = Field(..., description="Instrucción para el modelo")
+    temperatura: float = Field(0.7, ge=0.0, le=2.0)
+    max_tokens: int = Field(2000, ge=1, le=100000)
+    system_prompt: Optional[str] = Field(None)
+
+class EscribirArchivoInput(BaseToolModel):
+    ruta: str = Field(..., description="Ruta del archivo dentro de /app/workspace")
+    contenido: str = Field(..., description="Contenido del archivo")
+
+class EjecutarComandoInput(BaseToolModel):
+    comando: str = Field(..., description="Comando de shell a ejecutar")
+
+# ─────────────────────────────────────────────────────────────
+# LLM Utilities
+# ─────────────────────────────────────────────────────────────
+async def call_llm_with_retry(
+    provider_name: str,
+    provider_info: Dict,
+    model_id: str,
+    messages: List[Dict],
+    temperature: float,
+    max_tokens: int
+) -> Dict:
+    base_url = provider_info["baseUrl"].rstrip("/")
+    api_key = provider_info["api_key"]
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload = {"model": model_id, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+    for attempt in range(MAX_RETRIES):
+        try:
+            start = time.perf_counter()
+            resp = await state._http_client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+            latency = (time.perf_counter() - start) * 1000
+            if resp.status_code == 401:
+                logger.error(f"API Key inválida para {provider_name}")
+                return {"error": "unauthorized", "message": "API Key inválida"}
+            if resp.status_code == 429:
+                await asyncio.sleep(BASE_BACKOFF * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            return {"data": resp.json(), "latency_ms": latency}
+        except Exception as e:
+            if attempt == MAX_RETRIES - 1:
+                logger.error(f"Fallo final en {provider_name}: {e}")
+                return {"error": "failed", "message": str(e)}
+            await asyncio.sleep(BASE_BACKOFF * (attempt + 1))
+    return {"error": "failed", "message": "Tiempo de espera agotado"}
+
+def extract_response_content(data: Dict, provider_name: str) -> str:
+    choices = data.get("choices", [])
+    if not choices:
+        return ""
+    message = choices[0].get("message", {})
+    content = message.get("content", "")
+    if not content or content.strip() == "":
+        reasoning = message.get("reasoning", "")
+        if reasoning and reasoning.strip():
+            logger.info(f"{provider_name}: content vacío, usando reasoning ({len(reasoning)} chars)")
+            return reasoning.strip()
+        reasoning_content = message.get("reasoning_content", "")
+        if reasoning_content and reasoning_content.strip():
+            logger.info(f"{provider_name}: content vacío, usando reasoning_content ({len(reasoning_content)} chars)")
+            return reasoning_content.strip()
+    return content.strip() if content else ""
+
+# ─────────────────────────────────────────────────────────────
+# Tools Endpoints (POST /tools/*)
+# ─────────────────────────────────────────────────────────────
+@app.get("/health", operation_id="health")
+async def health():
+    return {"status": "healthy", "version": "2.4.0"}
+
+@app.get("/tools/verificar_sistema", operation_id="verificar_sistema")
+async def verificar_sistema():
+    return {
+        "github": "✅" if state._github_client else "❌",
+        "local_docs": "✅",
+        "workspace": "✅",
+        "providers": len(state._configured_providers)
+    }
+
+@app.post("/tools/buscar_modelo_gratis", operation_id="buscar_modelo_gratis")
+async def buscar_modelo_gratis(input: BuscarModeloGratisInput):
+    best = state.get_best_provider(input.criterio)
+    return {"recomendacion": best if best else "No se encontró modelo ideal"}
+
+@app.post("/tools/consultar_llm_externo", operation_id="consultar_llm_externo")
+async def consultar_llm_externo(input: ConsultarLLMExternoInput):
+    candidates = list(state._configured_providers.items())
+    if input.provider_id:
+        target = state._configured_providers.get(input.provider_id)
+        if target:
+            candidates.insert(0, (input.provider_id, target))
+    for p_name, p_info in candidates:
+        model_id = input.model_id or p_info["models"][0]["id"]
+        messages = []
+        if input.system_prompt:
+            messages.append({"role": "system", "content": input.system_prompt})
+        messages.append({"role": "user", "content": input.prompt})
+        logger.info(f"Intentando consulta con proveedor: {p_name}...")
+        result = await call_llm_with_retry(p_name, p_info, model_id, messages, input.temperatura, input.max_tokens)
+        if "data" in result:
+            logger.info(f"Respuesta exitosa de {p_name}")
+            response_text = extract_response_content(result["data"], p_name)
+            return {"provider": p_name, "model": model_id, "response": response_text}
+        else:
+            logger.warning(f"{p_name} falló: {result.get('message')}. Probando siguiente...")
+    raise HTTPException(status_code=503, detail="Ningún proveedor de LLM respondió correctamente.")
+
+# ─────────────────────────────────────────────────────────────
+# GitHub Endpoints
+# ─────────────────────────────────────────────────────────────
+@app.post("/tools/buscar_repo", operation_id="buscar_repo")
+async def buscar_repo(input: BuscarRepoInput):
+    async def _do_search():
+        repos = state._github_client.search_repositories(query=input.query)
+        if repos.totalCount == 0:
+            return "No se encontraron repositorios para la búsqueda."
+        results = [{"nombre": r.full_name, "estrellas": r.stargazers_count} for r in repos[:5]]
+        return results
+    try:
+        result = await github_call_with_retry(_do_search)
+        return {"result": result}
+    except (GitHubRateLimitError, GitHubAuthError, GitHubNotFoundError, GitHubForbiddenError, GitHubValidationError):
+        raise
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error inesperado en buscar_repo")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/tools/mapear_repositorio", operation_id="mapear_repositorio")
+async def mapear_repositorio(input: MapearRepoInput):
+    async def _do_map():
+        contents = state._github_client.get_repo(input.repo).get_contents(input.ruta)
+        return {"result": "\n".join([f"{'📁' if i.type=='dir' else '📄'} {i.path}" for i in contents])}
+    try:
+        return await github_call_with_retry(_do_map)
+    except (GitHubRateLimitError, GitHubAuthError, GitHubNotFoundError, GitHubForbiddenError, GitHubValidationError):
+        raise
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error inesperado en mapear_repositorio")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/tools/leer_archivo", operation_id="leer_archivo")
+async def leer_archivo(input: LeerArchivoInput):
+    async def _do_read():
+        content = state._github_client.get_repo(input.repo).get_contents(input.ruta).decoded_content.decode("utf-8")
+        return {"content": content}
+    try:
+        return await github_call_with_retry(_do_read)
+    except (GitHubRateLimitError, GitHubAuthError, GitHubNotFoundError, GitHubForbiddenError, GitHubValidationError):
+        raise
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error inesperado en leer_archivo")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/tools/listar_issues", operation_id="listar_issues")
+async def listar_issues(input: ListarIssuesInput):
+    async def _do_list():
+        repo_obj = state._github_client.get_repo(input.repo)
+        issues = repo_obj.get_issues(state=input.estado)
+        results = []
+        for i, issue in enumerate(issues):
+            if i >= input.limite: break
+            results.append({"numero": issue.number, "titulo": issue.title, "estado": issue.state, "url": issue.html_url})
+        return {"result": results if results else "No se encontraron issues."}
+    try:
+        return await github_call_with_retry(_do_list)
+    except (GitHubRateLimitError, GitHubAuthError, GitHubNotFoundError, GitHubForbiddenError, GitHubValidationError):
+        raise
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error inesperado en listar_issues")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/tools/buscar_codigo", operation_id="buscar_codigo")
+async def buscar_codigo(input: BuscarCodigoInput):
+    async def _do_search_code():
+        results = state._github_client.search_code(query=input.query)
+        code_snippets = []
+        for i, file in enumerate(results):
+            if i >= 5: break
+            code_snippets.append({"archivo": file.html_url, "repositorio": file.repository.full_name})
+        return {"result": code_snippets if code_snippets else "No se encontró código."}
+    try:
+        return await github_call_with_retry(_do_search_code)
+    except (GitHubRateLimitError, GitHubAuthError, GitHubNotFoundError, GitHubForbiddenError, GitHubValidationError):
+        raise
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error inesperado en buscar_codigo")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/tools/crear_issue", operation_id="crear_issue")
+async def crear_issue(input: CrearIssueInput):
+    async def _do_create():
+        issue = state._github_client.get_repo(input.repo).create_issue(title=input.titulo, body=input.cuerpo)
+        return {"result": issue.html_url}
+    try:
+        return await github_call_with_retry(_do_create)
+    except (GitHubRateLimitError, GitHubAuthError, GitHubNotFoundError, GitHubForbiddenError, GitHubValidationError):
+        raise
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error inesperado en crear_issue")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─────────────────────────────────────────────────────────────
+# Local Files Endpoints (Fixed: Path safety, recursive listing)
+# ─────────────────────────────────────────────────────────────
+@app.get("/tools/listar_archivos_locales", operation_id="listar_archivos_locales")
+async def listar_locales():
+    try:
+        base = Path("/app/local_docs")
+        if not base.exists():
+            return {"error": "Directorio /app/local_docs no existe", "files": []}
+        files = []
+        for f in base.rglob("*"):
+            if f.is_file():
+                rel = f.relative_to(base)
+                files.append({
+                    "name": str(rel),
+                    "size": f.stat().st_size,
+                    "suffix": f.suffix,
+                    "modified": datetime.fromtimestamp(f.stat().st_mtime).isoformat()
+                })
+        return {"files": files, "count": len(files)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/tools/leer_local", operation_id="leer_local")
+async def leer_local(input: LeerLocalInput):
+    try:
+        base = Path("/app/local_docs").resolve()
+        target = (base / input.nombre_archivo).resolve()
+        if not str(target).startswith(str(base)):
+            raise HTTPException(400, "Path traversal detectado: archivo fuera de /app/local_docs")
+        if not target.exists():
+            raise HTTPException(404, f"Archivo no encontrado: {input.nombre_archivo}")
+        if not target.is_file():
+            raise HTTPException(400, "No es un archivo")
+        suffix = target.suffix.lower()
+        if suffix == ".pdf" and HAS_PDF:
+            with open(target, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                text = "\n".join([p.extract_text() for p in reader.pages])
+                return {"file": input.nombre_archivo, "content": text, "size": len(text)}
+        if suffix == ".docx" and HAS_DOCX:
+            doc = docx.Document(target)
+            text = "\n".join([p.text for p in doc.paragraphs])
+            return {"file": input.nombre_archivo, "content": text, "size": len(text)}
+        content = target.read_text(encoding="utf-8", errors="ignore")
+        return {"file": input.nombre_archivo, "content": content, "size": len(content)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/tools/escribir_archivo_local", operation_id="escribir_archivo_local")
+async def escribir_archivo_local(input: EscribirArchivoInput):
+    try:
+        base = Path("/app/workspace").resolve()
+        target = (base / input.ruta).resolve()
+        if not str(target).startswith(str(base)):
+            raise HTTPException(400, "Path traversal detectado: archivo fuera de /app/workspace")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(input.contenido, encoding="utf-8")
+        return {"file": input.ruta, "status": "written", "size": len(input.contenido)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/tools/ejecutar_comando", operation_id="ejecutar_comando")
+async def ejecutar_comando(input: EjecutarComandoInput):
+    try:
+        process = subprocess.run(
+            input.comando,
+            shell=True,
+            cwd="/app/workspace",
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        return {"stdout": process.stdout, "stderr": process.stderr, "exit_code": process.returncode}
+    except subprocess.TimeoutExpired:
+        return {"error": "El comando tardó demasiado tiempo en ejecutarse."}
+    except Exception as e:
+        return {"error": str(e)}
+
+# ─────────────────────────────────────────────────────────────
+# OpenAPI & Root
+# ─────────────────────────────────────────────────────────────
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    app.openapi_schema = get_openapi(title="GitHub MCP Server Pro", version="2.4.0", routes=app.routes)
+    return app.openapi_schema
+
+app.openapi = custom_openapi
+
+@app.get("/", include_in_schema=False)
+async def root():
+    return {"status": "online", "version": "2.4.0", "docs": "/docs", "openapi": "/openapi.json", "health": "/health"}
+
+# ─────────────────────────────────────────────────────────────
+# Entrypoint (Fixed __name__)
+# ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8888)

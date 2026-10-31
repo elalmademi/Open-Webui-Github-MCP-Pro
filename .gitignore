@@ -1,0 +1,121 @@
+# =============================================================================
+# .gitignore - GitHub MCP Server Pro v2.1 + OpenWebUI Stack
+# =============================================================================
+# Copia este archivo a la RAÍZ de tu repositorio (donde está docker-compose.yml)
+# =============================================================================
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECRETOS Y CONFIGURACIÓN LOCAL (NUNCA COMMITEAR)
+# ──────────────────────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+docker-compose.local.yml
+docker-compose.override.yml
+*.pem
+*.key
+*.crt
+secrets/
+credentials/
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DATOS PERSISTENTES Y LOGS (GENERADOS EN RUNTIME)
+# ──────────────────────────────────────────────────────────────────────────────
+logs/
+data/
+openwebui_data/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CACHE Y ARCHIVOS TEMPORALES
+# ──────────────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+*.egg-info/
+dist/
+build/
+.wheel/
+*.whl
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ENTORNOS VIRTUALES Y DEPENDENCIAS LOCALES
+# ──────────────────────────────────────────────────────────────────────────────
+venv/
+env/
+.envrc
+.venv/
+pipenv/
+poetry.lock
+Pipfile.lock
+
+# ──────────────────────────────────────────────────────────────────────────────
+# IDE Y EDITORES
+# ──────────────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.sublime-project
+*.sublime-workspace
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DOCKER Y CONTENEDORES
+# ──────────────────────────────────────────────────────────────────────────────
+.docker/
+docker-compose.*.local.yml
+.dockerignore
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DOCUMENTOS LOCALES (MONTADOS COMO VOLUMEN, NO EN REPO)
+# ──────────────────────────────────────────────────────────────────────────────
+local_docs/
+mcp-github-server/local_docs/
+*.pdf
+*.docx
+*.doc
+*.xlsx
+*.pptx
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BACKUPS Y ARCHIVOS TEMPORALES
+# ──────────────────────────────────────────────────────────────────────────────
+*.bak
+*.backup
+*.tmp
+*.temp
+*_backup*
+*_old*
+mcp-github-server.backup/
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ARCHIVOS DE SISTEMA WINDOWS
+# ──────────────────────────────────────────────────────────────────────────────
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+System Volume Information/
+
+# =============================================================================
+# NOTA: Si usas Git LFS para modelos grandes, añade:
+# *.bin
+# *.gguf
+# *.safetensors
+# =============================================================================

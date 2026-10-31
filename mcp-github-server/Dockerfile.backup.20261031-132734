@@ -1,0 +1,32 @@
+# Usamos una única imagen base para evitar borrar las instalaciones
+FROM python:3.11-slim
+
+# Variables de entorno para optimizar Python en Docker
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Directorio de trabajo
+WORKDIR /app
+
+# 1. Instalación de dependencias del sistema
+# Instalamos git (obligatorio para Fase 2), curl (para healthcheck) y build-essential
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    wget \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Instalación de dependencias de Python
+# Copiamos primero el requirements para aprovechar la caché de Docker
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 3. Copiar el resto del código de la aplicación
+COPY . .
+
+# Exponemos el puerto 8889 (coincidiendo con el main.py v2.3.0)
+EXPOSE 8889
+
+# Comando de inicio
+CMD ["python", "main.py"]

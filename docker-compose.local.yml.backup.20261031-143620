@@ -1,0 +1,61 @@
+﻿services:
+  open-webui-dev:
+    image: ghcr.io/open-webui/open-webui:v0.11.4
+    container_name: open-webui-dev
+    ports:
+      - "8080:8080"
+    env_file: .env
+    environment:
+      - OPENAI_API_BASE_URL=https://openrouter.ai/v1
+      - OPENAI_API_KEY=\
+      - TOOLS_OPEN_API_URL=http://mcp-github-server:8888
+      - ENABLE_COMMUNITY_SHARING=false
+      - ENABLE_MESSAGE_RATING=true
+      - ENABLE_SIGNUP=true
+    volumes:
+      - openwebui-mcp-cloud_openwebui_data:/app/backend/data
+    networks:
+      - dev-net
+    restart: always
+
+  mcp-github-server:
+    build:
+      context: ./mcp-github-server
+      dockerfile: Dockerfile
+    container_name: mcp-github-server
+    ports:
+      - "8888:8888"
+    env_file: .env
+    environment:
+      - HOST=0.0.0.0
+      - LOG_LEVEL=INFO
+      - TZ=UTC
+      - CACHE_TTL=86400
+      - REQUEST_TIMEOUT=30
+      - MAX_RETRIES=3
+      - GITHUB_TOKEN=\
+      - OPENWEBUI_URL=http://open-webui-dev:8080
+    volumes:
+      - "C:/Users/Alejandro/Documents/IA/Documentos_MCP:/app/local_docs:ro"
+      - "C:/Users/Alejandro/Documents/IA/Workspace:/app/workspace"
+      - ./logs:/app/logs
+    networks:
+      - dev-net
+    restart: always
+    depends_on:
+      - open-webui-dev
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8888/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+networks:
+  dev-net:
+    driver: bridge
+
+volumes:
+  openwebui-mcp-cloud_openwebui_data:
+    external: true
+

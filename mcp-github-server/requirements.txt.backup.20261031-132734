@@ -1,0 +1,34 @@
+# =============================================================================
+# requirements.txt - GitHub MCP Server Pro v2.1
+# =============================================================================
+# Versión corregida: usa PyGithub (no github) para evitar compilación C++ en Windows
+# Todas las dependencias tienen wheels precompilados (manylinux/win32)
+# =============================================================================
+
+# Core Framework
+mcp<2
+fastapi==0.110.1
+uvicorn[standard]==0.29.0
+httpx==0.27.0
+pydantic==2.7.1
+pydantic-settings==2.3.3
+
+# GitHub API - IMPORTANTE: PyGithub (NO github)
+# github=1.2.7 trae aiohttp==3.8.1 que requiere Visual C++ Build Tools
+# PyGithub usa requests (pure Python, sin compilación)
+PyGithub==2.4.0
+
+# Document Processing
+python-docx==1.1.0
+PyPDF2==3.0.1
+
+# Utilities
+python-dotenv==1.0.1
+python-multipart==0.0.9
+
+# =============================================================================
+# NOTAS:
+# - Todas las versiones tienen wheels para: manylinux2014, win32, win_amd64, macosx
+# - pip install --only-binary=:all: -r requirements.txt  # Fuerza wheels, no source
+# - En Docker (Linux) compila nativo sin problemas; en Windows host usa wheels
+# =============================================================================
