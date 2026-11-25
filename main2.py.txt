@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+GitHub MCP Server Pro - Versión Final Corregida (Funciona)
+- Usa wrapper FastAPI + uvicorn (no mcp.run() con host/port)
+- FastMCP nativo montado en raíz
+- Registro de herramientas al arranque
+- Bind 0.0.0.0:8000 via uvicorn
+"""
+import uvicorn
+import asyncio
+import logging
+import os
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+from types import SimpleNamespace
+
+from mcp.server.fastmcp import FastMCP
+from fastapi import FastAPI, Response
+
+# Config & Settings
+from config.settings import get_settings, Settings
+
+# Services
+from services.github_service import GitHubService
+from services.catalog_service import CatalogService
+from services.local_fs_service import LocalFSService
+from services.llm_router import LLMRouter
+from services.device_registry import DeviceRegistry
+from services.appium_manager import AppiumManager
+from services.maestro_runner import MaestroRunner
+
+# Tools
+from tools.github_tools import register_github_tools
+from tools.local_tools import register_local_tools
+from tools.llm_tools import register_llm_tools
+from tools.mobile_tools import register_mobile_tools
+
+# Middleware
+from middleware.logging import setup_structured_logging, get_logger
+
+# ─── Global Services Container ───
+class ServiceContainer:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.logger = get_logger("mcp.container")
+        self.github = None
+        self.catalog = None
+        self.local_fs = None
+        self.llm_router = None
+        self.device_registry = None
+        self.appium_manager = None
+        self.maestro_runner = None
+        self._http_client = None
+
+    async def initialize(self) -> None:
+        self.logger.info("Inicializando servicios...")
+        self.github = GitHubService(
+            token=self.settings.github_token,
+            timeout=self.settings.github_timeout,
+            max_retries=self.settings.github_max_retries,
+        )
+        self.catalog = CatalogService(self.settings)
+        await self.catalog.initialize()
+        self.local_fs = LocalFSService(self.settings)
+        import httpx
+        self._http_client = httpx.AsyncClient(timeout=self.settings.llm_request_timeout)
+        self.llm_router = LLMRouter(
+            catalog=self.catalog,
+            settings=self.settings,
+            http_client=self._http_client,
+        )
+        await self.llm_router.initialize()
+        self.device_registry = DeviceRegistry(self.settings)
+        await self.device_registry.initialize()
+        self.appium_manager = AppiumManager(self.settings)
+        await self.appium_manager.initialize()
+        self.maestro_runner = MaestroRunner(self.settings)
+        await self.maestro_runner.initialize()
+        self.logger.info("✅ Todos los servicios inicializados correctamente")
+
+    async def shutdown(self) -> None:
+        self.logger.info("Cerrando servicios...")
+        shutdown_tasks = [
+            self.maestro_runner.shutdown(),
+            self.appium_manager.shutdown(),
+            self.device_registry.shutdown(),
+            self.llm_router.shutdown(),
+            self.catalog.shutdown(),
+        ]
+        if self._http_client:
+            shutdown_tasks.append(self._http_client.aclose())
+        await asyncio.gather(*[t for t in shutdown_tasks if t], return_exceptions=True)
+        self.logger.info("✅ Servicios cerrados")
+
+@asynccontextmanager
+async def lifespan(app: FastMCP) -> AsyncGenerator[None, None]:
+    app.state = SimpleNamespace()
+    settings = get_settings()
+    setup_structured_logging(
+        level=settings.log_level,
+        format=settings.log_format,
+        loggers={"github": "INFO", "mcp": "DEBUG" if settings.debug else "INFO"},
+    )
+    logger = get_logger("mcp.lifespan")
+    logger.info(f"🚀 Iniciando {settings.app_name} v{settings.app_version}")
+
+    container = ServiceContainer(settings)
+    await container.initialize()
+    app.state.container = container
+
+    logger.info("Registrando herramientas MCP en el arranque...")
+    register_github_tools(app, container.github)
+    register_local_tools(app, container.local_fs)
+    register_llm_tools(app, container.catalog, container.llm_router)
+    register_mobile_tools(app, container.device_registry, container.appium_manager, container.maestro_runner)
+    logger.info("✅ Todas las herramientas MCP registradas al inicio")
+
+    try:
+        yield
+    finally:
+        await container.shutdown()
+        logger.info(f"👋 {settings.app_name} apagado correctamente")
+
+# ─── FastMCP App ───
+from mcp.server.fastmcp import FastMCP
+from fastapi import FastAPI, Response
+from config.settings import get_settings, Settings
+
+settings = get_settings()
+
+mcp = FastMCP(
+    name=settings.app_name,
+    lifespan=lifespan,
+)
+
+# ─── Health Check Tools ───
+@mcp.tool()
+async def health() -> dict:
+    container: ServiceContainer = mcp.state.container
+    return {
+        "status": "healthy",
+        "version": settings.app_version,
+        "environment": settings.environment,
+        "services": {
+            "github": "✅" if container.github and container.github.is_authenticated else "⚠️",
+            "catalog": "✅" if container.catalog and container.catalog._providers_cache else "⚠️",
+            "local_fs": "✅",
+            "llm_router": "✅" if container.llm_router else "⚠️",
+            "device_registry": "✅" if container.device_registry else "⚠️",
+            "appium": "✅" if container.appium_manager else "⚠️",
+            "maestro": "✅" if container.maestro_runner else "⚠️",
+        },
+    }
+
+@mcp.tool()
+async def verificar_sistema() -> dict:
+    container: ServiceContainer = mcp.state.container
+    return {
+        "github": "✅" if container.github and container.github.is_authenticated else "❌",
+        "local_docs": "✅" if container.local_fs.local_docs.exists() else "❌",
+        "workspace": "✅" if container.local_fs.workspace.exists() else "❌",
+        "version": settings.app_version,
+    }
+
+# ─── Register Tools ───
+def _get_container() -> ServiceContainer:
+    return mcp.state.container
+
+_tools_registered = False
+
+def _ensure_tools_registered():
+    global _tools_registered
+    if _tools_registered:
+        return
+    container = _get_container()
+    register_github_tools(mcp, container.github)
+    register_local_tools(mcp, container.local_fs)
+    register_llm_tools(mcp, container.catalog, container.llm_router)
+    register_mobile_tools(mcp, container.device_registry, container.appium_manager, container.maestro_runner)
+    globals()["_tools_registered"] = True
+    get_logger("mcp.tools").info("✅ Todas las tools MCP registradas")
+
+original_call = mcp.call_tool
+async def _call_tool_with_registration(name: str, arguments: dict):
+    _ensure_tools_registered()
+    return await original_call(name, arguments)
+
+mcp.call_tool = _call_tool_with_registration
+
+# ─── Entrypoint: Wrapper FastAPI + uvicorn (FUNCIONA) ───
+if __name__ == "__main__":
+    # 1. Wrapper FastAPI para rutas globales (/health)
+    wrapper_app = FastAPI(title="GitHub MCP Server Pro", version="2.6.0")
+
+    # Health check ANTES del mount
+    @wrapper_app.get("/health")
+    async def health_check():
+        return Response(content="OK", status_code=200)
+
+    # Obtener app MCP nativa (Starlette)
+    mcp_app = mcp.streamable_http_app()
+
+    # Montar MCP en root (/) para que /health funcione en wrapper
+    wrapper_app.mount("/", mcp_app)
+
+    print("🚀 Lanzando Servidor MCP Pro en 0.0.0.0:8000...")
+    print("   - Health check: http://0.0.0.0:8000/health")
+    print("   - MCP endpoint: http://0.0.0.0:8000/")
+    
+    # ✅ USA UVICORN DIRECTAMENTE (no mcp.run)
+    uvicorn.run(wrapper_app, host="0.0.0.0", port=8000, log_level="info")

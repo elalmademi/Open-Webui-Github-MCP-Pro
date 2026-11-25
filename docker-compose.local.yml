@@ -1,0 +1,109 @@
+﻿services:
+  open-webui-dev:
+    image: ghcr.io/open-webui/open-webui:0.13.5
+    container_name: open-webui-dev
+    ports:
+      - "8080:8080"
+    environment:
+      - ENABLE_COMMUNITY_SHARING=false
+      - ENABLE_MESSAGE_RATING=true
+      - EXTRA_HOSTS=host.docker.internal:host-gateway
+      - ENABLE_MCP=true
+    volumes:
+      - openwebui-mcp-cloud_openwebui_data:/app/backend/data
+    networks:
+      - dev-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  mcp-github-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUILD_DATE: "${BUILD_DATE}"
+        VCS_REF: "${VCS_REF}"
+        VERSION: "${VERSION:-2.6.0}"
+    container_name: mcp-github-server
+    ports:
+      - "8000:8000"
+      - "9090:9090"
+    environment:
+      - OPENWEBUI_URL=http://open-webui-dev:8080
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - APPIUM_HOST=appium
+      - APPIUM_PORT=4723
+    volumes:
+      - "C:/Users/Alejandro/Documents/IA/Documentos:/app/local_docs:ro"
+      - "C:/Users/Alejandro/Documents/IA/Workspace:/app/workspace:rw"
+    networks:
+      - dev-net
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - appium
+      - open-webui-dev
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - dev-net
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  appium:
+    image: appium/appium:latest
+    container_name: appium
+    ports:
+      - "4723:4723"
+    networks:
+      - dev-net
+    restart: unless-stopped
+    command: >
+      appium
+      --allow-insecure=adb_shell
+      --relaxed-security
+      --log-level info
+      --port 4723
+    volumes: []
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4723/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+networks:
+  dev-net:
+    driver: bridge
+    name: mcp-pro-dev-net
+
+volumes:
+  openwebui-mcp-cloud_openwebui_data:
+    external: true
+  redis_data:
+    driver: local

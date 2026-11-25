@@ -1,0 +1,208 @@
+# ─── Catálogo de Proveedores LLM ───
+# Mapea nombre del proveedor → variable de entorno API Key
+# Si no requiere key (ej. Kilo Code), usar "no_key_required: true"
+
+providers:
+  # ── Tier 1: Rápidos / Código ──
+  Groq:
+    env_var: "GROQ_API_KEY"
+    category: "speed"
+    tags: ["speed", "code", "free-tier"]
+    best_for: ["code", "speed", "reasoning"]
+    models:
+      - id: "llama-3.3-70b-versatile"
+        modality: "text"
+        context: "128K"
+      - id: "llama-3.1-8b-instant"
+        modality: "text"
+        context: "128K"
+
+  Cerebras:
+    env_var: "CEREBRAS_API_KEY"
+    category: "speed"
+    tags: ["speed", "inference"]
+    best_for: ["speed", "low-latency"]
+    models:
+      - id: "llama3.1-70b"
+        modality: "text"
+        context: "8K"
+
+  # ── Tier 2: Contexto Largo / Razonamiento ──
+  "Google Gemini":
+    env_var: "GEMINI_API_KEY"
+    category: "reasoning"
+    tags: ["reasoning", "long-context", "multimodal"]
+    best_for: ["reasoning", "long-context", "multimodal", "code"]
+    models:
+      - id: "gemini-1.5-pro"
+        modality: "multimodal"
+        context: "2M"
+      - id: "gemini-1.5-flash"
+        modality: "multimodal"
+        context: "1M"
+
+  "OpenRouter":
+    env_var: "OPENROUTER_API_KEY"
+    category: "aggregator"
+    tags: ["aggregator", "fallback", "many-models"]
+    best_for: ["fallback", "model-comparison", "free-models"]
+    models:
+      - id: "openrouter/auto"
+        modality: "text"
+        context: "variable"
+
+  # ── Tier 3: Especializados ──
+  Cohere:
+    env_var: "COHERE_API_KEY"
+    category: "enterprise"
+    tags: ["enterprise", "rag", "embeddings"]
+    best_for: ["rag", "embeddings", "classification"]
+    models:
+      - id: "command-r-plus"
+        modality: "text"
+        context: "128K"
+      - id: "command-r"
+        modality: "text"
+        context: "128K"
+
+  "Mistral AI":
+    env_var: "MISTRAL_API_KEY"
+    category: "balanced"
+    tags: ["balanced", "code", "multilingual"]
+    best_for: ["code", "multilingual", "reasoning"]
+    models:
+      - id: "mistral-large-latest"
+        modality: "text"
+        context: "128K"
+      - id: "codestral-latest"
+        modality: "code"
+        context: "32K"
+
+  "NVIDIA NIM":
+    env_var: "NVIDIA_API_KEY"
+    category: "enterprise"
+    tags: ["enterprise", "self-hosted", "optimized"]
+    best_for: ["enterprise", "self-hosted", "optimized-inference"]
+    models:
+      - id: "nvidia/llama-3.1-nemotron-70b-instruct"
+        modality: "text"
+        context: "128K"
+
+  # ── Tier 4: Sin Key / Locales ──
+  "Kilo Code":
+    env_var: ""  # No requiere API key
+    category: "local"
+    tags: ["free", "no-key", "code", "local"]
+    best_for: ["code", "free", "no-key"]
+    no_key_required: true
+    models:
+      - id: "kilo-code/default"
+        modality: "code"
+        context: "32K"
+
+  "LLM7.io":
+    env_var: ""
+    category: "free"
+    tags: ["free", "no-key", "aggregator"]
+    best_for: ["free", "testing"]
+    no_key_required: true
+    models:
+      - id: "llm7/default"
+        modality: "text"
+        context: "8K"
+
+  "OVHcloud AI Endpoints":
+    env_var: ""
+    category: "free"
+    tags: ["free", "no-key", "eu-hosted"]
+    best_for: ["free", "eu-hosted", "privacy"]
+    no_key_required: true
+    models:
+      - id: "ovh/mistral-7b"
+        modality: "text"
+        context: "32K"
+
+  # ── Tier 5: Cloud Providers ──
+  "Cloudflare Workers AI":
+    env_var: "CLOUDFLARE_API_KEY"
+    category: "edge"
+    tags: ["edge", "serverless", "free-tier"]
+    best_for: ["edge", "serverless", "low-latency"]
+    models:
+      - id: "@cf/meta/llama-3.1-8b-instruct"
+        modality: "text"
+        context: "8K"
+
+  HuggingFace:
+    env_var: "HUGGINGFACE_API_KEY"
+    category: "community"
+    tags: ["community", "open-source", "many-models"]
+    best_for: ["open-source", "experimentation"]
+    models:
+      - id: "meta-llama/Meta-Llama-3.1-70B-Instruct"
+        modality: "text"
+        context: "8K"
+
+  "SiliconFlow":
+    env_var: "SILICONFLOW_API_KEY"
+    category: "china"
+    tags: ["china", "fast", "free-tier"]
+    best_for: ["china", "speed"]
+    models:
+      - id: "deepseek-ai/DeepSeek-V2.5"
+        modality: "text"
+        context: "128K"
+
+  "ModelScope":
+    env_var: "MODELSCOPE_API_KEY"
+    category: "china"
+    tags: ["china", "community"]
+    best_for: ["china", "chinese-models"]
+    models:
+      - id: "qwen/Qwen2.5-72B-Instruct"
+        modality: "text"
+        context: "128K"
+
+  # ── Tier 6: Self-hosted / Locales ──
+  "Ollama Cloud":
+    env_var: "OLLAMA_API_KEY"
+    category: "local"
+    tags: ["local", "self-hosted", "privacy"]
+    best_for: ["privacy", "local", "offline"]
+    models:
+      - id: "llama3.1:70b"
+        modality: "text"
+        context: "128K"
+      - id: "codellama:34b"
+        modality: "code"
+        context: "16K"
+
+  AionLabs:
+    env_var: "AIONLABS_API_KEY"
+    category: "specialized"
+    tags: ["bio", "chemistry", "specialized"]
+    best_for: ["biology", "chemistry", "drug-discovery"]
+    models:
+      - id: "aion-labs/default"
+        modality: "text"
+        context: "8K"
+
+  "Z AI (Zhipu AI)":
+    env_var: "ZAI_API_KEY"
+    category: "china"
+    tags: ["china", "glm", "long-context"]
+    best_for: ["china", "long-context", "glm"]
+    models:
+      - id: "glm-4"
+        modality: "multimodal"
+        context: "128K"
+
+  "Aion Labs":
+    env_var: "AIONLABS_API_KEY"
+    category: "specialized"
+    tags: ["bio", "chemistry"]
+    best_for: ["biology", "chemistry"]
+    models:
+      - id: "aion-labs/default"
+        modality: "text"
+        context: "8K"
